@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+    <title>局域网快传 · 文件与消息</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">⚡ 局域网快传</div>
+      <button id="btnHistory" class="ghost" title="查看保存的历史会话">🗂 历史记录</button>
+      <div class="name-row">
+        <input id="nameInput" type="text" maxlength="24" placeholder="昵称" />
+        <button id="saveName">保存</button>
+      </div>
+    </header>
+
+    <main class="wrap">
+      <!-- LOBBY -->
+      <section id="lobby" class="card">
+        <h1>开始</h1>
+        <p class="muted">
+          两台或多台设备在<span class="b">同一局域网</span>内，各自打开本网页即可互传文件与消息，无需服务器。<br />
+          首次连接需用<span class="b">扫码或粘贴码</span>配对一次；之后新设备只需扫一个码即可加入全网。
+        </p>
+        <div class="btn-row">
+          <button id="btnCreate" class="primary">创建房间</button>
+          <button id="btnJoin" class="primary">加入房间</button>
+        </div>
+        <p class="hint">建议使用 Chrome / Edge 浏览器。如摄像头不可用，全程可用“粘贴码”代替扫码。</p>
+
+        <hr class="sep" />
+        <h2>服务器模式（免扫码）</h2>
+        <p class="muted">
+          用 Docker 跑一个信令服务后，这里填一次服务地址，设备即可<span class="b">自动发现并组网，全程免扫码</span>。
+          文件/消息仍是设备间直传（服务器不碰数据）。
+        </p>
+        <div class="btn-row">
+          <input id="serverUrl" type="text" placeholder="服务地址，如 192.168.3.13:8080（打开本页时已自动填入当前服务器地址，可改可清）" />
+          <button id="btnServer" class="primary">连接服务器</button>
+        </div>
+        <p class="hint" id="serverHint">未连接服务器。</p>
+
+        <hr class="sep" />
+        <h2>TURN 中继（手机直连失败时用）</h2>
+        <p class="muted">
+          手机在同一 WiFi 下若显示「直连失败/重新连接中」，多半是路由器隔离或 mDNS 受限。填一个 TURN 服务器可让流量经服务器中转，必能连上。<br />
+          本项目自带 coturn（Docker 部署时已一起运行），默认已填好。
+        </p>
+        <div class="btn-row">
+          <input id="turnUrl" type="text" placeholder="turn:服务器IP:3478" />
+          <input id="turnUser" type="text" placeholder="用户名" style="max-width:120px" />
+          <input id="turnPass" type="text" placeholder="密码" style="max-width:120px" />
+          <button id="saveTurn" class="primary">保存 TURN</button>
+        </div>
+        <p class="hint" id="turnHint">未启用 TURN（仅靠同网直连）。</p>
+      </section>
+
+      <!-- CREATE: show offer -->
+      <section id="createSection" class="card" hidden>
+        <h2>邀请对方加入</h2>
+        <p class="muted">把下面的二维码或邀请码发给对方（让TA点“加入房间”）。</p>
+        <div class="qr-wrap"><canvas id="offerCanvas"></canvas></div>
+        <textarea id="offerString" readonly rows="4" class="codetext"></textarea>
+        <div class="btn-row">
+          <button id="copyOffer">复制邀请码</button>
+        </div>
+      </section>
+
+      <!-- CREATE: scan/paste answer -->
+      <section id="answerScanSection" class="card" hidden>
+        <h2>回执对方的回执码</h2>
+        <p class="muted">对方加入后会显示一个回执二维码/码，请扫回来或粘到下面。</p>
+        <div class="btn-row">
+          <button id="btnScanAnswer" class="primary">📷 扫描回执码</button>
+          <label class="file-pick" for="answerPhotoInput" title="拍照识别回执码（HTTP 也可用）">📸 拍照识别</label>
+          <input id="answerPhotoInput" type="file" accept="image/*" capture="environment" hidden />
+        </div>
+        <video id="answerScanVideo" class="scan-video" hidden playsinline muted></video>
+        <textarea id="pasteAnswer" rows="4" class="codetext" placeholder="或把对方的回执码粘贴到这里"></textarea>
+        <div class="btn-row">
+          <button id="pasteAnswerGo" class="primary">用回执码连接</button>
+        </div>
+      </section>
+
+      <!-- JOIN: paste/scan offer -->
+      <section id="joinSection" class="card" hidden>
+        <h2>加入房间</h2>
+        <p class="muted">把对方（创建房间者）给的邀请码粘贴到下面，或直接扫码。</p>
+        <div class="btn-row">
+          <button id="pasteOfferGo" class="primary">用邀请码加入</button>
+          <button id="btnScanOffer">📷 扫描邀请码</button>
+          <label class="file-pick" for="offerPhotoInput" title="拍照识别邀请码（HTTP 也可用）">📸 拍照识别</label>
+          <input id="offerPhotoInput" type="file" accept="image/*" capture="environment" hidden />
+        </div>
+        <textarea id="pasteOffer" rows="4" class="codetext" placeholder="把邀请码粘贴到这里"></textarea>
+        <video id="scanOfferVideo" class="scan-video" hidden playsinline muted></video>
+      </section>
+
+      <!-- ROOM VIEW -->
+      <section id="roomView" hidden>
+        <div class="room-grid">
+          <div class="panel peers-panel">
+            <h3>成员 <span id="status" class="status">连接中…</span></h3>
+            <ul id="peerList" class="peer-list"></ul>
+            <div class="answer-show" id="answerShow" hidden>
+              <p class="muted small">把你的回执码交给创建者（扫码或粘贴）：</p>
+              <div class="qr-wrap"><canvas id="answerCanvas"></canvas></div>
+              <textarea id="answerString" readonly rows="3" class="codetext"></textarea>
+              <div class="btn-row">
+                <button id="copyAnswer">复制回执码</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel chat-panel">
+            <div class="panel-head">
+              <h3>消息与文件（全局共享）</h3>
+              <button id="btnSaveMessages" class="ghost" title="保存当前会话到历史记录">💾 保存消息</button>
+            </div>
+            <div id="chatLog" class="chat-log"></div>
+            <div class="chat-input-row">
+              <input id="chatInput" type="text" placeholder="输入消息，回车发送…" />
+              <label class="file-pick" for="fileInput" title="发送文件">📎</label>
+              <input id="fileInput" type="file" hidden />
+              <button id="chatSend" class="primary">发送</button>
+            </div>
+          </div>
+        </div>
+        <div class="btn-row">
+          <button id="cancelPair">断开 / 返回</button>
+        </div>
+      </section>
+    </main>
+
+    <!-- 图片点击放大灯箱 -->
+    <div id="imgLightbox" class="lightbox" hidden>
+      <img id="imgLightboxImg" alt="" />
+    </div>
+
+    <!-- 保存消息确认框 -->
+    <div id="saveOverlay" class="overlay" hidden>
+      <div class="overlay-card">
+        <h3>💾 保存当前会话</h3>
+        <p class="muted small" id="saveSummary">将保存当前会话的消息到历史记录。</p>
+        <label class="check-row">
+          <input type="checkbox" id="saveIncludeFiles" />
+          同时保存文件（占用更多存储）
+        </label>
+        <div class="btn-row right">
+          <button id="saveCancel">取消</button>
+          <button id="saveConfirm" class="primary">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 历史记录列表 -->
+    <div id="historyOverlay" class="overlay" hidden>
+      <div class="overlay-card wide">
+        <div class="overlay-head">
+          <h3>🗂 历史记录</h3>
+          <div class="overlay-tools">
+            <label class="small">最大保留
+              <input id="maxKeepInput" type="number" min="1" max="500" style="width:64px" />
+              条
+            </label>
+            <button id="historyClearAll">清空全部</button>
+            <button id="historyClose" class="primary">关闭</button>
+          </div>
+        </div>
+        <div id="historyList" class="history-list"></div>
+      </div>
+    </div>
+
+    <!-- 历史记录详情查看 -->
+    <div id="historyViewOverlay" class="overlay" hidden>
+      <div class="overlay-card wide">
+        <div class="overlay-head">
+          <h3 id="historyViewTitle">会话详情</h3>
+          <div class="overlay-tools">
+            <button id="historyViewClose" class="primary">返回列表</button>
+          </div>
+        </div>
+        <div id="historyViewLog" class="chat-log static"></div>
+      </div>
+    </div>
+
+    <!-- vendor libs (local, offline) -->
+    <script src="vendor/qrcode-generator.js"></script>
+    <script src="vendor/jsQR.js"></script>
+    <!-- app -->
+    <script src="core/identity.js"></script>
+    <script src="core/signaling.js"></script>
+    <script src="core/server-signaling.js"></script>
+    <script src="core/transport.js"></script>
+    <script src="core/mesh.js"></script>
+    <script src="core/storage.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

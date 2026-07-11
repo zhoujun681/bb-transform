@@ -1,0 +1,19 @@
+services:
+  bb-transform:
+    build: .
+    image: bb-transform:latest
+    container_name: bb-transform
+    ports:
+      # Node signaling + static web host
+      - "8080:8080"
+      # TURN relay signaling port (BOTH tcp and udp — coturn listens on both)
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      # TURN relay (allocation) UDP range — MUST match server/turnserver.conf
+      # (min-port..max-port). Each ongoing allocation takes one port.
+      # 20 ports is enough for a handful of phones on a LAN.
+      - "49152-49171:49152-49171/udp"
+    restart: unless-stopped
+    # Optional overrides:
+    # environment:
+    #   - PORT=8080

@@ -1,0 +1,12 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+*.md
+test
+_cert.pem
+_key.pem
+serve.bat
+serve_https.py
+.claude
+server/node_modules

@@ -1,0 +1,63 @@
+# ===== 私密 / 凭证（绝不入库）=====
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+_cert.pem
+_key.pem
+# TURN / 服务凭证、密码、token
+.env
+.env.*
+*.secret
+
+# ===== 依赖 =====
+node_modules/
+server/node_modules/
+**/node_modules/
+
+# ===== 构建产物 =====
+# 单文件 exe 打包产物（含 ~55MB exe + 源码副本）
+desktop/dist/
+desktop/stage/
+# 其它打包/部署的源码副本（与根目录重复，维护时易脱节）
+部署/
+dist/
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# ===== 日志 / 运行时 =====
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ===== 备份 / 临时 =====
+*.bak
+*.backup
+*.orig
+*.tmp
+*.swp
+*~
+# 误生成的碎片文件
+Proceed)
+
+# ===== 编辑器 / IDE =====
+.vscode/
+.idea/
+*.iml
+*.code-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Claude 会话数据（私密）=====
+.claude/
+
+# ===== 系统 =====
+ehthumbs.db
+$RECYCLE.BIN/

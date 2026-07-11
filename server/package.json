@@ -1,0 +1,14 @@
+{
+  "name": "bb-transform-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dumb WebSocket signaling relay + static host for the bb-transform LAN app. Never touches file/message data (those stay P2P over WebRTC).",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

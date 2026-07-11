@@ -1,0 +1,4 @@
+# packaging output
+stage/
+dist/
+# pkg base-binary cache lives elsewhere (PKG_CACHE_PATH); nothing tracked here
