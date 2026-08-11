@@ -21,14 +21,25 @@ fi
 if ! openssl x509 -in _cert.pem -noout -ext subjectAltName 2>/dev/null |
     grep -Fq "IP Address:${SERVER_IP}"; then
   echo "Refreshing the self-signed certificate for ${SERVER_IP}..."
-  openssl req -x509 -newkey rsa:2048 \
-    -keyout _key.pem -out _cert.pem -days 365 -nodes \
-    -subj "/CN=bb-transform-local" \
-    -addext "subjectAltName=DNS:localhost,DNS:${HOST_NAME},IP:127.0.0.1,IP:${SERVER_IP}"
+  if ! openssl req -x509 -newkey rsa:2048 \
+      -keyout _key.pem -out _cert.pem -days 365 -nodes \
+      -subj "/CN=bb-transform-local" \
+      -addext "subjectAltName=DNS:localhost,DNS:${HOST_NAME},IP:127.0.0.1,IP:${SERVER_IP}" \
+      >/dev/null 2>&1; then
+    echo "Failed to generate the HTTPS certificate." >&2
+    exit 1
+  fi
 fi
 
 chmod 600 _key.pem
-docker compose up -d --build
+if docker compose version >/dev/null 2>&1; then
+  docker compose up -d --build
+elif command -v docker-compose >/dev/null 2>&1; then
+  docker-compose up -d --build
+else
+  echo "Docker Compose is unavailable. Install the compose plugin or docker-compose." >&2
+  exit 1
+fi
 
 echo
 echo "bb-transform is running:"

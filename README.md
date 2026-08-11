@@ -26,7 +26,7 @@ https://运行服务器的电脑IP:8443
 ```
 页面**自动连服务器、自动发现全网、自动建立直连**，全程免扫码。手机连不上时 TURN 自动兜底（详见下文「连不上的排查」）。
 
-运行 `pack-deploy.ps1` 会把 HTTPS 启动脚本、`_cert.pem` 和 `_key.pem` 一起放入部署目录。上传到已安装 Docker、Docker Compose 和 OpenSSL 的 Linux 后执行 `sh deploy-linux.sh`，脚本会在证书 IP 不匹配时自动按 Linux 当前 IP 重新生成，并默认同时开启 HTTP `8081` 与 HTTPS `8443`。证书为自签证书；请在访问设备上信任部署后目录中的 `_cert.pem`，并妥善保护 `_key.pem`。
+运行 `pack-deploy.ps1` 会把 HTTPS 启动脚本、`_cert.pem` 和 `_key.pem` 一起放入部署目录。上传到已安装 Docker、Docker Compose（支持新版 `docker compose` 或旧版 `docker-compose`）和 OpenSSL 的 Linux 后执行 `sh deploy-linux.sh`，脚本会在证书 IP 不匹配时自动按 Linux 当前 IP 重新生成，并默认同时开启 HTTP `8081` 与 HTTPS `8443`。证书为自签证书；请在访问设备上信任部署后目录中的 `_cert.pem`，并妥善保护 `_key.pem`。
 
 ### 方式二：免 Docker 直接跑信令服务器
 
@@ -71,6 +71,59 @@ node desktop/build.js       # 产物在 desktop/dist/
 - **实时速度**：传输时状态栏显示瞬时速度（MB/s）+ 连接类型（直连/TURN 中转）+ 背压状态。
 - **会话历史**：可保存当前会话（含/不含文件）到 IndexedDB，随时回看。
 - **诊断**：成员列表显示每台设备的直连状态（已直连/直连中/重试中/失败）+ ICE 候选统计；设备退出网页后由信令服务立即通知其他成员移除。
+
+---
+
+## Windows 复制后粘贴到桌面
+
+### 为什么只部署 HTTPS 仍然不能粘贴文件
+
+HTTPS 只能开放浏览器标准剪贴板 API。Chrome/Edge 通常可以写入图片和文本，但不能生成 Windows 桌面、资源管理器识别的 `CF_HDROP` 文件格式。因此：
+
+- 直接打开 Linux 页面 `https://服务器IP:8443` 时，可以按浏览器能力复制图片或文本；任意二进制文件不能直接粘贴成桌面文件。
+- Linux 服务不能操作访问者 Windows 电脑的系统剪贴板。
+- 需要粘贴到桌面的每台 Windows 电脑，都必须运行本项目的本地剪贴板桥接，并从 `localhost` 打开页面。
+
+Linux 仍然负责全网信令和 TURN，文件仍通过 WebRTC 在设备间传输；Windows 本地服务只在用户点击「复制」时，把浏览器已经收到的 Blob 临时保存到本机并写入 Windows 剪贴板。
+
+### Windows 客户端操作
+
+1. 在需要粘贴文件的 Windows 电脑启动本地服务。使用打包版：
+
+   ```bat
+   desktop\dist\start-server.bat 8765
+   ```
+
+   没有打包版时，在项目根目录使用 PowerShell：
+
+   ```powershell
+   $env:PORT=8765
+   node server/server.js
+   ```
+
+2. 在同一台 Windows 电脑的 Chrome/Edge 打开：
+
+   ```text
+   http://localhost:8765
+   ```
+
+3. 在「服务器模式」中填写 Linux 信令地址并连接：
+
+   ```text
+   wss://Linux服务器IP:8443
+   ```
+
+4. 将 TURN 地址改为 Linux 服务器：
+
+   ```text
+   turn:Linux服务器IP:3478
+   ```
+
+5. 文件接收完成后，点击文件卡片中的「复制」，再在桌面或资源管理器按 `Ctrl+V`。
+
+成功时页面会提示「文件已复制，可粘贴到桌面或资源管理器」；图片会提示「图片已复制，可粘贴到桌面或富文本应用」。如果仍提示「浏览器不支持直接复制此文件类型，请使用下载」，说明当前页面没有使用 Windows 本地桥接，请检查地址是否确实为 `http://localhost:8765`，并确认本地 Node/exe 服务正在运行。
+
+> Linux 使用自签证书时，需要先在 Windows 浏览器访问 `https://Linux服务器IP:8443` 并信任部署目录中的 `_cert.pem`，否则 `wss://` 信令连接可能被浏览器拒绝。
 
 ---
 

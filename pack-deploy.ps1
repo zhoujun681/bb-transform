@@ -73,6 +73,7 @@ $Files = @(
     "index.html",
     "styles.css",
     "app.js",
+    "README.md",
     "serve_https.py",
     "serve.bat",
     "deploy-linux.sh",
