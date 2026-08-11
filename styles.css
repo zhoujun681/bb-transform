@@ -297,7 +297,9 @@ button.primary:hover {
   height: 8px;
 }
 .file-link {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   margin-top: 8px;
   background: var(--accent-2);
   color: #04210f;
@@ -305,6 +307,34 @@ button.primary:hover {
   padding: 8px 14px;
   border-radius: 8px;
   font-weight: 600;
+}
+
+.file-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 8px;
+}
+.file-actions .file-copy,
+.file-actions .file-link {
+  min-height: 44px;
+  padding: 8px 12px;
+  margin-top: 0;
+  font-size: 13px;
+}
+.file-actions .file-copy {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.file-actions .file-copy:hover {
+  background: #2f6fed;
+}
+.file-actions .file-copy:disabled {
+  cursor: wait;
+  opacity: 0.65;
 }
 
 /* inline image thumbnail inside a message bubble */
@@ -324,6 +354,7 @@ button.primary:hover {
 /* file card as inline message-body content (videos + other files) */
 .msg-file {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
   padding: 6px 8px;
@@ -351,11 +382,10 @@ button.primary:hover {
   font-size: 12px;
   opacity: 0.8;
 }
-.msg-file .file-link {
-  margin-top: 0;
-  padding: 6px 10px;
-  font-size: 13px;
-  flex: 0 0 auto;
+.msg-file .file-actions {
+  width: 100%;
+  justify-content: flex-end;
+  margin-top: 2px;
 }
 
 /* progress bar inside a message bubble */

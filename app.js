@@ -756,6 +756,7 @@
           openLightbox(lightboxUrl);
         });
         body.appendChild(img);
+        body.appendChild(buildFileActions(res.meta, res.blob));
         els.chatLog.scrollTop = els.chatLog.scrollHeight;
         return;
       }
@@ -842,9 +843,155 @@
     }, 4000);
   }
 
-  // Build a file card (icon + name + size + optional download). `blob` is the
-  // received/sent Blob; we wire the download button to downloadBlob() instead
-  // of a passive <a download>, which is unreliable on mobile browsers.
+  function isTextFile(meta) {
+    const type = (meta && meta.type) || '';
+    const name = ((meta && meta.name) || '').toLowerCase();
+    return type.startsWith('text/') ||
+      /(?:json|xml|javascript|yaml|csv)$/.test(type) ||
+      /\.(?:txt|md|csv|json|xml|ya?ml|log|js|ts|css|html?)$/.test(name);
+  }
+
+  function blobToDataUrl(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error || new Error('read failed'));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function imageBlobToPng(blob) {
+    if (blob.type === 'image/png') return Promise.resolve(blob);
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.naturalWidth || img.width;
+          canvas.height = img.naturalHeight || img.height;
+          canvas.getContext('2d').drawImage(img, 0, 0);
+          canvas.toBlob((png) => {
+            URL.revokeObjectURL(url);
+            if (png) resolve(png);
+            else reject(new Error('image conversion failed'));
+          }, 'image/png');
+        } catch (err) {
+          URL.revokeObjectURL(url);
+          reject(err);
+        }
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('image decode failed'));
+      };
+      img.src = url;
+    });
+  }
+
+  async function fallbackCopyImage(blob, meta) {
+    const dataUrl = await blobToDataUrl(blob);
+    let handled = false;
+    const onCopy = (e) => {
+      if (!e.clipboardData) return;
+      e.preventDefault();
+      const alt = String((meta && meta.name) || 'image').replace(/["<>]/g, '');
+      e.clipboardData.setData('text/html', `<img src="${dataUrl}" alt="${alt}">`);
+      e.clipboardData.setData('text/uri-list', dataUrl);
+      handled = true;
+    };
+    document.addEventListener('copy', onCopy);
+    try {
+      return document.execCommand('copy') && handled;
+    } finally {
+      document.removeEventListener('copy', onCopy);
+    }
+  }
+
+  async function writeBlobToClipboard(blob, meta) {
+    if (isTextFile(meta)) {
+      if (navigator.clipboard && typeof navigator.clipboard.write === 'function' &&
+          typeof ClipboardItem !== 'undefined') {
+        const textBlob = blob.type === 'text/plain' ? blob : new Blob([blob], { type: 'text/plain' });
+        await navigator.clipboard.write([new ClipboardItem({ 'text/plain': textBlob })]);
+        return '文本内容已复制，可直接粘贴';
+      }
+      const ok = await writeTextValue(await blob.text());
+      if (!ok) throw new Error('text copy failed');
+      return '文本内容已复制，可直接粘贴';
+    }
+
+    const isImage = ((meta && meta.type) || blob.type || '').startsWith('image/');
+    const type = isImage ? 'image/png' : (blob.type || (meta && meta.type) || 'application/octet-stream');
+
+    if (navigator.clipboard && typeof navigator.clipboard.write === 'function' &&
+        typeof ClipboardItem !== 'undefined') {
+      if (typeof ClipboardItem.supports === 'function' && !ClipboardItem.supports(type)) {
+        throw new Error('unsupported clipboard type');
+      }
+      const clipboardValue = isImage ? imageBlobToPng(blob) : blob;
+      await navigator.clipboard.write([
+        new ClipboardItem({ [type]: clipboardValue }, { presentationStyle: isImage ? 'inline' : 'attachment' }),
+      ]);
+      return isImage ? '图片已复制，可直接粘贴' : '文件已复制，可直接粘贴';
+    }
+
+    if (isImage && await fallbackCopyImage(await imageBlobToPng(blob), meta)) {
+      return '图片已复制，可粘贴到支持富文本的应用';
+    }
+    throw new Error('binary clipboard requires a secure context');
+  }
+
+  function buildFileActions(meta, blob) {
+    const actions = document.createElement('div');
+    actions.className = 'file-actions';
+
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'file-copy';
+    copyBtn.textContent = '复制';
+    copyBtn.title = `复制 ${meta.name || '文件'} 到剪贴板`;
+    copyBtn.addEventListener('click', async () => {
+      const original = copyBtn.textContent;
+      copyBtn.disabled = true;
+      copyBtn.setAttribute('aria-busy', 'true');
+      copyBtn.textContent = '复制中…';
+      try {
+        const message = await writeBlobToClipboard(blob, meta);
+        copyBtn.textContent = '已复制';
+        toast(message);
+      } catch (err) {
+        copyBtn.textContent = '复制失败';
+        if (!window.isSecureContext && !isTextFile(meta) && classify(meta) !== 'image') {
+          toast('当前 HTTP 页面不能复制二进制文件，请使用 HTTPS 或下载');
+        } else if (err && err.name === 'NotAllowedError') {
+          toast('剪贴板权限被拒绝，请允许权限后重试');
+        } else {
+          toast('浏览器不支持直接复制此文件类型，请使用下载');
+        }
+      } finally {
+        setTimeout(() => {
+          copyBtn.disabled = false;
+          copyBtn.removeAttribute('aria-busy');
+          copyBtn.textContent = original;
+        }, 1500);
+      }
+    });
+    actions.appendChild(copyBtn);
+
+    const download = document.createElement('a');
+    download.className = 'file-link';
+    download.href = '#';
+    download.textContent = '下载';
+    download.addEventListener('click', (e) => {
+      e.preventDefault();
+      downloadBlob(blob, meta.name);
+    });
+    actions.appendChild(download);
+    return actions;
+  }
+
+  // Build a file card (icon + name + size + optional clipboard/download actions).
   function buildFileCard(meta, blob) {
     const card = document.createElement('div');
     card.className = 'msg-file';
@@ -864,15 +1011,7 @@
     card.appendChild(ico);
     card.appendChild(metaDiv);
     if (blob) {
-      const a = document.createElement('a');
-      a.className = 'file-link';
-      a.href = '#';
-      a.textContent = '下载';
-      a.addEventListener('click', (e) => {
-        e.preventDefault();
-        downloadBlob(blob, meta.name);
-      });
-      card.appendChild(a);
+      card.appendChild(buildFileActions(meta, blob));
     }
     return card;
   }
@@ -1065,6 +1204,7 @@
           openLightbox(fullUrl);
         });
         body.appendChild(img);
+        body.appendChild(buildFileActions(meta, blob));
         return;
       }
     }
@@ -1322,18 +1462,11 @@
           lightboxUrl = URL.createObjectURL(file); // full-resolution original
           openLightbox(lightboxUrl);
         });
+        body.appendChild(buildFileActions(meta, file));
       } else {
         const card = body.querySelector('.msg-file');
         if (card) {
-          const a = document.createElement('a');
-          a.className = 'file-link';
-          a.href = '#';
-          a.textContent = '下载';
-          a.addEventListener('click', (e) => {
-            e.preventDefault();
-            downloadBlob(file, meta.name);
-          });
-          card.appendChild(a);
+          card.appendChild(buildFileActions(meta, file));
         }
       }
     } catch (err) {
@@ -1370,35 +1503,39 @@
     toastTimer = setTimeout(() => (t.className = 'toast'), 2500);
   }
 
-  function copyText(text, btn) {
+  async function writeTextValue(text) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch {}
+    }
+    return fallbackCopyValue(text);
+  }
+
+  async function copyText(text, btn) {
     if (!text) {
       toast('没有可复制的内容');
-      return;
+      return false;
     }
-    const onSuccess = () => {
+    const old = btn && btn.textContent;
+    const ok = await writeTextValue(text);
+    if (ok) {
       toast('已复制，去粘贴给对方');
       if (btn) {
-        const old = btn.textContent;
-        btn.textContent = '✓ 已复制';
+        btn.textContent = '已复制';
         setTimeout(() => (btn.textContent = old), 1500);
       }
-    };
-    // Preferred path: async Clipboard API. Only available on secure contexts
-    // (https / localhost); on plain http://LAN-IP it is undefined.
-    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-      navigator.clipboard
-        .writeText(text)
-        .then(onSuccess)
-        .catch(() => fallbackCopy(text, btn, onSuccess));
-      return;
+      return true;
     }
-    fallbackCopy(text, btn, onSuccess);
+    toast('复制失败，请手动选中文字框内容复制');
+    return false;
   }
 
   // Synchronous fallback for non-secure contexts (http LAN): a transient
   // <textarea> + document.execCommand('copy'). Deprecated but still works
   // everywhere and is the only option without HTTPS.
-  function fallbackCopy(text, btn, onSuccess) {
+  function fallbackCopyValue(text) {
     try {
       const ta = document.createElement('textarea');
       ta.value = text;
@@ -1411,13 +1548,9 @@
       ta.select();
       const ok = document.execCommand('copy');
       document.body.removeChild(ta);
-      if (ok) {
-        onSuccess();
-      } else {
-        toast('复制失败，请手动选中文字框内容复制');
-      }
+      return ok;
     } catch {
-      toast('复制失败，请手动选中文字框内容复制');
+      return false;
     }
   }
 
