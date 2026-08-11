@@ -8,4 +8,5 @@ services:
     network_mode: host
     environment:
       - PORT=8081
+      - HTTPS_PORT=8443
     restart: unless-stopped

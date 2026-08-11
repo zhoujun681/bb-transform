@@ -15,11 +15,13 @@ RUN cd server && npm install --omit=dev
 # Copy the server and static app.
 COPY server ./server
 COPY index.html styles.css app.js ./
+COPY _cert.pem _key.pem ./
 COPY core ./core
 COPY vendor ./vendor
 
 ENV PORT=8081
-EXPOSE 8081 3478
+ENV HTTPS_PORT=8443
+EXPOSE 8081 8443 3478
 
 # Supervisord keeps coturn and the Node signaling server in the same image.
 CMD ["supervisord", "-c", "/app/server/supervisord.conf"]

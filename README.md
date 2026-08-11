@@ -15,15 +15,18 @@ cd bb-transform
 docker compose up --build        # 构建并运行
 ```
 
-容器同时跑三个服务：
-- **网页 + 信令**（`:8080`，HTTP/WS）
+容器同时跑四个入口：
+- **网页 + 信令**（`:8081`，HTTP/WS）
+- **安全网页 + 信令**（`:8443`，HTTPS/WSS）
 - **TURN 中继**（`:3478` TCP+UDP，用于手机直连失败时兜底）
 
 同局域网任何设备的浏览器（**Chrome / Edge**，别用自带浏览器）打开：
 ```
-http://运行服务器的电脑IP:8080
+https://运行服务器的电脑IP:8443
 ```
 页面**自动连服务器、自动发现全网、自动建立直连**，全程免扫码。手机连不上时 TURN 自动兜底（详见下文「连不上的排查」）。
+
+运行 `pack-deploy.ps1` 会把 HTTPS 启动脚本、`_cert.pem` 和 `_key.pem` 一起放入部署目录。上传到已安装 Docker、Docker Compose 和 OpenSSL 的 Linux 后执行 `sh deploy-linux.sh`，脚本会在证书 IP 不匹配时自动按 Linux 当前 IP 重新生成，并默认同时开启 HTTP `8081` 与 HTTPS `8443`。证书为自签证书；请在访问设备上信任部署后目录中的 `_cert.pem`，并妥善保护 `_key.pem`。
 
 ### 方式二：免 Docker 直接跑信令服务器
 

@@ -25,6 +25,7 @@ import socketserver
 import ssl
 import subprocess
 import sys
+import shutil
 
 # Force UTF-8 stdout so emoji / Chinese don't crash on the default GBK Windows console.
 try:
@@ -80,8 +81,20 @@ def ensure_cert():
     for ip in local_ips():
         if ip != "127.0.0.1":
             san += f",IP:{ip}"
+    openssl = shutil.which("openssl")
+    if not openssl and os.name == "nt":
+        candidates = [
+            r"C:\Program Files\Git\usr\bin\openssl.exe",
+            r"C:\Program Files\Git\mingw64\bin\openssl.exe",
+            r"C:\Program Files\OpenSSL-Win64\bin\openssl.exe",
+        ]
+        openssl = next((item for item in candidates if os.path.exists(item)), None)
+    if not openssl:
+        print("❌ 生成证书失败：未找到 openssl。")
+        sys.exit(1)
+
     cmd = [
-        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+        openssl, "req", "-x509", "-newkey", "rsa:2048",
         "-keyout", KEY, "-out", CERT, "-days", "365", "-nodes",
         "-subj", "/CN=bb-transform-local",
         "-addext", f"subjectAltName={san}",
@@ -89,7 +102,7 @@ def ensure_cert():
     try:
         subprocess.run(cmd, check=True, capture_output=True)
     except Exception as e:
-        print("❌ 生成证书失败，请确认系统已安装 openssl：", e)
+        print("❌ 生成证书失败：", e)
         sys.exit(1)
 
 

@@ -35,13 +35,26 @@ $ErrorActionPreference = "Stop"
 # 脚本所在目录即为项目根目录
 $ProjectRoot = $PSScriptRoot
 $DeployPath  = Join-Path $ProjectRoot $DeployDir
+$CertPath    = Join-Path $ProjectRoot "_cert.pem"
+$KeyPath     = Join-Path $ProjectRoot "_key.pem"
 
 Write-Host "==> 项目根目录: $ProjectRoot" -ForegroundColor Cyan
 Write-Host "==> 部署目录:   $DeployPath" -ForegroundColor Cyan
 Write-Host ""
 
 # ---------------------------------------------------------------------------
-# 1. 删除原有部署目录并重建（保证每次都是干净的全新打包）
+# 1. 确保证书存在。serve_https.py 会复用已有证书，不会每次覆盖。
+# ---------------------------------------------------------------------------
+if (-not (Test-Path $CertPath) -or -not (Test-Path $KeyPath)) {
+    Write-Host "==> 未找到 HTTPS 证书，正在生成自签证书..." -ForegroundColor Yellow
+    & python -c "import serve_https; serve_https.ensure_cert()"
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $CertPath) -or -not (Test-Path $KeyPath)) {
+        throw "HTTPS 证书生成失败，请检查 Python/OpenSSL 后重试。"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 2. 删除原有部署目录并重建（保证每次都是干净的全新打包）
 # ---------------------------------------------------------------------------
 if (Test-Path $DeployPath) {
     Write-Host "==> 删除原有部署目录..." -ForegroundColor Yellow
@@ -51,7 +64,7 @@ Write-Host "==> 创建部署目录..." -ForegroundColor Green
 New-Item -Path $DeployPath -ItemType Directory -Force | Out-Null
 
 # ---------------------------------------------------------------------------
-# 2. 需要复制的文件清单（Dockerfile 构建上下文所依赖的顶层文件）
+# 3. 需要复制的文件清单（Dockerfile 构建上下文所依赖的顶层文件）
 # ---------------------------------------------------------------------------
 $Files = @(
     "Dockerfile",
@@ -59,11 +72,16 @@ $Files = @(
     ".dockerignore",
     "index.html",
     "styles.css",
-    "app.js"
+    "app.js",
+    "serve_https.py",
+    "serve.bat",
+    "deploy-linux.sh",
+    "_cert.pem",
+    "_key.pem"
 )
 
 # ---------------------------------------------------------------------------
-# 3. 需要复制的目录清单（保留原结构，排除 node_modules）
+# 4. 需要复制的目录清单（保留原结构，排除 node_modules）
 # ---------------------------------------------------------------------------
 $Dirs = @(
     "core",
@@ -72,7 +90,7 @@ $Dirs = @(
 )
 
 # ---------------------------------------------------------------------------
-# 4. 复制单个文件
+# 5. 复制单个文件
 # ---------------------------------------------------------------------------
 Write-Host "==> 复制文件..." -ForegroundColor Green
 foreach ($file in $Files) {
@@ -86,7 +104,7 @@ foreach ($file in $Files) {
 }
 
 # ---------------------------------------------------------------------------
-# 5. 复制目录（使用 robocopy，排除 node_modules）
+# 6. 复制目录（使用 robocopy，排除 node_modules）
 #    robocopy 退出码 < 8 均视为成功
 # ---------------------------------------------------------------------------
 Write-Host "==> 复制目录..." -ForegroundColor Green
@@ -107,11 +125,11 @@ foreach ($dir in $Dirs) {
 }
 
 # ---------------------------------------------------------------------------
-# 6. 完成
+# 7. 完成
 # ---------------------------------------------------------------------------
 Write-Host ""
 Write-Host "==> 打包完成！" -ForegroundColor Green
 Write-Host "    部署目录: $DeployPath" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "    传输到服务器后，在该目录执行:" -ForegroundColor DarkGray
-Write-Host "        docker compose up -d --build" -ForegroundColor DarkGray
+Write-Host "        sh deploy-linux.sh" -ForegroundColor DarkGray
