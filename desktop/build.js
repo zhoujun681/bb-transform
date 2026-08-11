@@ -55,6 +55,10 @@ mkdirp(DIST);
 console.log('[build] staging server/ (server.js + package.json + node_modules)');
 copyRecursive(path.join(ROOT, 'server', 'server.js'), path.join(STAGE, 'server.js'));
 copyRecursive(
+  path.join(ROOT, 'server', 'windows-clipboard.js'),
+  path.join(STAGE, 'windows-clipboard.js')
+);
+copyRecursive(
   path.join(ROOT, 'server', 'package.json'),
   path.join(STAGE, 'package.json')
 );
@@ -116,9 +120,14 @@ copyRecursive(
   path.join(DESKTOP, 'start-server.bat'),
   path.join(DIST, 'start-server.bat')
 );
+copyRecursive(
+  path.join(DESKTOP, 'windows-clipboard.ps1'),
+  path.join(DIST, 'windows-clipboard.ps1')
+);
 
 console.log('\n[build] done.');
 console.log('  -> ' + path.relative(ROOT, path.join(DIST, EXE_NAME)));
 console.log('  -> ' + path.relative(ROOT, path.join(DIST, 'start-server.bat')));
+console.log('  + native clipboard helper (windows-clipboard.ps1)');
 console.log('  + static assets (index.html, app.js, core/, vendor/, styles.css)');
 console.log('\nDistribute the whole desktop/dist/ folder. Double-click start-server.bat.');

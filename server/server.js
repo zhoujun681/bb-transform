@@ -3,9 +3,10 @@
 // Role: route control envelopes {layer:'ctrl', type, from, to, ttl, id, data}
 // between connected clients so they can auto-mesh WITHOUT QR scanning.
 //
-// IMPORTANT: this server is a relay ONLY. It never inspects/forwards file or
-// chat data — those travel peer-to-peer over WebRTC DataChannels. The server
-// sees only offer/answer/hello/peers/bye control messages.
+// IMPORTANT: signaling is relay-only. It never inspects/forwards file or chat
+// data — those travel peer-to-peer over WebRTC DataChannels. On Windows, a
+// local-only HTTP endpoint can materialize a received Blob in the temp folder
+// when the user explicitly copies it, so Explorer can consume CF_HDROP.
 //
 // Security on a trusted LAN (still applied):
 //   - clients register their id; the server STAMPS `from` from the socket's
@@ -20,6 +21,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
+const WindowsClipboard = require('./windows-clipboard');
 
 const HTTP_PORT = parseInt(process.env.PORT || '8080', 10);
 const HTTPS_PORT = parseInt(process.env.HTTPS_PORT || '8443', 10);
@@ -43,7 +45,9 @@ const MIME = {
 };
 
 // ---------- static file server ----------
-function staticHandler(req, res) {
+async function staticHandler(req, res) {
+  if (await WindowsClipboard.handleRequest(req, res, ROOT)) return;
+
   let urlPath = decodeURIComponent((req.url || '/').split('?')[0]);
   // never serve server-side files
   if (urlPath.startsWith('/server/')) {

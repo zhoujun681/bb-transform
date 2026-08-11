@@ -908,7 +908,56 @@
     }
   }
 
+  let nativeClipboardAvailability = null;
+
+  async function hasNativeClipboard() {
+    if (!/^https?:$/.test(window.location.protocol)) return false;
+
+    const endpoint = new URL('/api/clipboard/file', window.location.href);
+    if (!nativeClipboardAvailability) {
+      nativeClipboardAvailability = fetch(endpoint, {
+        method: 'GET',
+        headers: { 'X-BB-Clipboard': '1' },
+        credentials: 'same-origin',
+        cache: 'no-store',
+      }).then(async (response) => {
+        if (!response.ok) return false;
+        const result = await response.json();
+        return result && result.ok === true;
+      }).catch(() => false);
+    }
+    return nativeClipboardAvailability;
+  }
+
+  async function writeBlobToNativeClipboard(blob, meta) {
+    if (!await hasNativeClipboard()) return false;
+
+    const endpoint = new URL('/api/clipboard/file', window.location.href);
+    endpoint.searchParams.set('name', (meta && meta.name) || 'download');
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'X-BB-Clipboard': '1' },
+        body: blob,
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
+      if (!response.ok) return false;
+      const result = await response.json();
+      return result && result.ok === true;
+    } catch {
+      return false;
+    }
+  }
+
   async function writeBlobToClipboard(blob, meta) {
+    if (await writeBlobToNativeClipboard(blob, meta)) {
+      const isImage = ((meta && meta.type) || blob.type || '').startsWith('image/');
+      if (isImage) return '图片已复制，可粘贴到桌面或富文本应用';
+      if (isTextFile(meta)) return '文件已复制，可粘贴到桌面或文本编辑器';
+      return '文件已复制，可粘贴到桌面或资源管理器';
+    }
+
     if (isTextFile(meta)) {
       if (navigator.clipboard && typeof navigator.clipboard.write === 'function' &&
           typeof ClipboardItem !== 'undefined') {
