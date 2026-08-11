@@ -223,6 +223,9 @@ button.primary:hover {
 .peer.restarting {
   border-left: 3px solid #f59e0b;
 }
+.peer.disconnected {
+  border-left: 3px solid #f59e0b;
+}
 .peer.failed {
   border-left: 3px solid #ef4444;
 }

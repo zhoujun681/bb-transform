@@ -86,6 +86,26 @@ function heartbeat() {
   this.isAlive = true;
 }
 
+function unregisterClient(ws) {
+  const id = ws.__clientId;
+  if (!id || clients.get(id) !== ws) return false;
+
+  clients.delete(id);
+  const payload = JSON.stringify({
+    layer: 0,
+    from: id,
+    to: '*',
+    ttl: 6,
+    id: 'gone-' + Math.random().toString(36).slice(2),
+    data: { type: 'peer-gone' },
+  });
+  for (const peer of clients.values()) {
+    if (peer.readyState !== 1) continue;
+    try { peer.send(payload); } catch {}
+  }
+  return true;
+}
+
 // Shared connection handler — used by BOTH the http and https WebSocketServers.
 function onWsConnection(ws) {
   ws.isAlive = true;
@@ -204,9 +224,7 @@ function onWsConnection(ws) {
   });
 
   ws.on('close', () => {
-    if (ws.__clientId && clients.get(ws.__clientId) === ws) {
-      clients.delete(ws.__clientId);
-    }
+    unregisterClient(ws);
   });
 }
 
@@ -260,8 +278,8 @@ if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
 const interval = setInterval(() => {
   for (const [cid, ws] of clients) {
     if (ws.isAlive === false) {
+      unregisterClient(ws);
       try { ws.terminate(); } catch {}
-      clients.delete(cid);
       continue;
     }
     ws.isAlive = false;

@@ -199,15 +199,17 @@
       els.turnPass.value = t.credential || '';
       applyTurn(t);
     } else {
-      // first visit: prefill the bundled-coturn default INTO THE INPUT BOX ONLY
-      // (so one click of "保存 TURN" opts in), but do NOT push it into
-      // ICE_SERVERS. An unreachable TURN entry hangs per-candidate allocation
-      // until its timeout, inflating gather time and slowing first connect.
-      // STUN-only until the user explicitly enables TURN.
-      els.turnUrl.value = defaultTurnUrl();
+      // The Docker image bundles coturn on the same host. Enable it by default
+      // as a fallback; ICE still prefers host/srflx direct candidates.
+      const url = defaultTurnUrl();
+      els.turnUrl.value = url;
       els.turnUser.value = TURN_DEFAULT_USER;
       els.turnPass.value = TURN_DEFAULT_PASS;
-      applyTurn(null);
+      applyTurn(url ? {
+        urls: url,
+        username: TURN_DEFAULT_USER,
+        credential: TURN_DEFAULT_PASS,
+      } : null);
     }
   }
 
@@ -438,6 +440,13 @@
       } else if (state !== 'connected' && info) {
         const c = info.cands || {};
         text += `\n候选: host=${c.host} srflx=${c.srflx} relay=${c.relay} · ICE: ${info.ice || '?'}`;
+        if (info.ice === 'disconnected' || info.ice === 'failed') {
+          if (!c.relay) {
+            text += '\n未启用 TURN：请检查 Linux 防火墙/网络隔离，或配置可用 TURN 服务';
+          } else {
+            text += '\n直连失败，正在尝试 TURN 中继…';
+          }
+        }
       }
       li.textContent = text;
       els.peerList.appendChild(li);
@@ -448,11 +457,15 @@
     } else if (connectedCount === n) {
       setStatus(`房间内 ${n} 位成员 · 全部已直连，可发送消息/文件`);
     } else {
-      setStatus(
-        `房间内 ${n} 位成员 · 已直连 ${connectedCount}，其余 ${
-          failedCount ? `${failedCount} 失败重试中、` : ''
-        }直连中…`
-      );
+      const retryingCount = failedCount + roster.reduce((count, peer) => {
+        const info = states.get(peer.id);
+        return count + (info && info.state === 'disconnected' ? 1 : 0);
+      }, 0);
+      const connectingCount = n - connectedCount - retryingCount;
+      const pendingLabels = [];
+      if (retryingCount) pendingLabels.push(`${retryingCount} 连接异常重试中`);
+      if (connectingCount > 0) pendingLabels.push(`${connectingCount} 直连中`);
+      setStatus(`房间内 ${n} 位成员 · 已直连 ${connectedCount}，${pendingLabels.join('、')}…`);
     }
   }
 
@@ -478,7 +491,7 @@
       case 'restarting':
         return '· 重新直连中…';
       case 'disconnected':
-        return '· 直连中…';
+        return '· 连接已断开，重试中…';
       default:
         return '· 直连中…';
     }
@@ -599,11 +612,11 @@
   }
 
   // A peer (sender or another receiver) signalled cancel for this file. If I'm
-  // the sender, cancelSend tears down my pump (my own UI cleans up in onSendFile).
+  // the sender, cancelSend tears down my pump (the queued sender UI cleans up).
   // Otherwise I'm a receiver (or already dropped) — drop local state + UI.
   function handleFileCancel(fileId, fromPeerId) {
     if (Transport.isOutbound(fileId)) {
-      Transport.cancelSend(fileId); // flag the pump; onSendFile's cancelled branch cleans UI
+      Transport.cancelSend(fileId); // flag the pump; the queued sender branch cleans UI
       return;
     }
     cancelReceivedFile(fileId);
@@ -1083,29 +1096,85 @@
     return { div, body };
   }
 
-  // single concurrent send — the one negotiated DataChannel + one drainGate
-  // slot make concurrent sends interleave chunks and break per-file cancel.
+  // Files from the picker and clipboard share one sequential UI queue. The
+  // transport fans each item out to peers independently once it starts.
   let isSending = false;
+  const fileQueue = [];
 
-  async function onSendFile() {
-    const file = els.fileInput.files && els.fileInput.files[0];
+  function onPickSendFiles() {
+    const files = [...(els.fileInput.files || [])];
     els.fileInput.value = ''; // reset so the same file can be picked again
-    if (!file) return;
+    enqueueFiles(files, 'picker');
+  }
+
+  function onPasteFiles(e) {
+    const data = e.clipboardData;
+    if (!data) return;
+    let files = [...(data.items || [])]
+      .filter((item) => item.kind === 'file')
+      .map((item) => item.getAsFile())
+      .filter(Boolean);
+    if (!files.length && data.files) files = [...data.files];
+    if (!files.length) return; // ordinary text paste keeps its native behavior
+
+    e.preventDefault();
+    enqueueFiles(files, 'clipboard');
+  }
+
+  function fallbackClipboardName(file, index) {
+    if (file.name) return file.name;
+    const extByType = {
+      'image/png': 'png',
+      'image/jpeg': 'jpg',
+      'image/gif': 'gif',
+      'image/webp': 'webp',
+    };
+    const ext = extByType[file.type] || 'bin';
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '').replace('T', '-');
+    return `clipboard-${stamp}${index ? '-' + (index + 1) : ''}.${ext}`;
+  }
+
+  function enqueueFiles(files, source) {
+    if (!files.length) return;
     if (Mesh.connectedPeers().length === 0) {
       toast('当前没有已连接的设备');
       return;
     }
-    if (isSending) {
-      toast('正在发送上一个文件，请先完成或取消');
-      return;
-    }
+    const wasBusy = isSending || fileQueue.length > 0;
+    files.forEach((file, index) => {
+      fileQueue.push({ file, name: source === 'clipboard' ? fallbackClipboardName(file, index) : file.name });
+    });
+    if (wasBusy) toast(`已加入发送队列（${fileQueue.length} 个待发送）`);
+    else if (source === 'clipboard') toast(files.length > 1 ? `正在发送 ${files.length} 个粘贴文件` : '正在发送粘贴文件');
+    processFileQueue();
+  }
 
+  async function processFileQueue() {
+    if (isSending) return;
+    isSending = true;
+    els.chatInput.setAttribute('aria-busy', 'true');
+    try {
+      while (fileQueue.length) {
+        if (Mesh.connectedPeers().length === 0) {
+          fileQueue.length = 0;
+          toast('连接已断开，发送队列已停止');
+          break;
+        }
+        await sendQueuedFile(fileQueue.shift());
+      }
+    } finally {
+      isSending = false;
+      els.chatInput.removeAttribute('aria-busy');
+      renderPeers();
+    }
+  }
+
+  async function sendQueuedFile(item) {
+    const { file, name } = item;
     // pre-generate the fileId so the cancel button works DURING the transfer
     const fileId = Transport.randomFileId();
-    isSending = true;
-    els.fileInput.disabled = true;
 
-    const meta = { name: file.name, size: file.size, type: file.type || 'application/octet-stream' };
+    const meta = { name, size: file.size, type: file.type || 'application/octet-stream' };
     const built = appendMsgBubble(true, `我 · ${fmtTime(Date.now())}`);
     const bubble = built.div;
     const body = built.body;
@@ -1150,7 +1219,7 @@
     // show whether the active path is direct (P2P) or via TURN relay
     let transportLabel = '';
     const peers0 = Mesh.connectedPeers();
-    if (peers0[0]) {
+    if (peers0.length === 1) {
       Mesh.transportKind(peers0[0]).then((k) => {
         transportLabel = k === 'relay' ? '（经 TURN 中转）' : k ? '（直连）' : '';
       });
@@ -1159,35 +1228,44 @@
     // Feature 2: getStats live speed (bytesSent delta) + backpressure diagnostic.
     // Polls every 500ms; cleared in finally. Falls back to the chunk-based bar.
     let statsTimer = null;
-    let lastStats = null;
-    const pollPeer = peers0[0];
-    if (pollPeer) {
+    const lastStats = new Map();
+    const highWater = Transport.localCapabilities().highWaterBytes || 4 * 1024 * 1024;
+    if (peers0.length) {
       statsTimer = setInterval(async () => {
-        const s = await Mesh.channelStats(pollPeer);
-        if (!s) return;
+        const samples = await Promise.all(peers0.map(async (peerId) => ({ peerId, stats: await Mesh.channelStats(peerId) })));
         const now = performance.now();
-        if (lastStats) {
-          const dt = (now - lastStats.t) / 1000;
-          const dB = (s.bytesSent - lastStats.bytesSent) || 0;
-          if (dt > 0) {
-            const mbps = dB > 0 ? (dB / (1024 * 1024)) / dt : 0;
-            const gate = s.bufferedAmount > 4 * 1024 * 1024 ? ' · 排空队列' : '';
-            setStatus(`发送中 · ${mbps.toFixed(1)} MB/s${transportLabel}${gate}`);
+        let bytesDelta = 0;
+        let elapsed = 0;
+        let draining = false;
+        for (const sample of samples) {
+          const s = sample.stats;
+          if (!s) continue;
+          const prev = lastStats.get(sample.peerId);
+          if (prev) {
+            elapsed = Math.max(elapsed, (now - prev.t) / 1000);
+            bytesDelta += Math.max(0, s.bytesSent - prev.bytesSent);
           }
+          draining ||= s.bufferedAmount > highWater;
+          lastStats.set(sample.peerId, { t: now, bytesSent: s.bytesSent });
         }
-        lastStats = { t: now, bytesSent: s.bytesSent };
+        if (elapsed > 0) {
+          const mbps = (bytesDelta / (1024 * 1024)) / elapsed;
+          const peerLabel = peers0.length > 1 ? ` · ${peers0.length} 台总计` : '';
+          const gate = draining ? ' · 排空队列' : '';
+          setStatus(`发送中 · ${mbps.toFixed(1)} MB/s${peerLabel}${transportLabel}${gate}`);
+        }
       }, 500);
     }
 
     try {
       const result = await Transport.sendFile(
         file,
-        file.name,
-        ({ sent, total }) => {
+        name,
+        ({ sentBytes, totalBytes }) => {
           const now = performance.now();
-          bar.max = total;
-          if (sent >= total || now - lastPaint >= PROGRESS_INTERVAL) {
-            bar.value = sent;
+          bar.max = totalBytes || 1;
+          if (sentBytes >= totalBytes || now - lastPaint >= PROGRESS_INTERVAL) {
+            bar.value = sentBytes;
             lastPaint = now;
           }
         },
@@ -1206,6 +1284,18 @@
         return;
       }
 
+      if (!result.deliveredPeerIds.length) {
+        bar.remove();
+        sendCancelBtn.remove();
+        const tag = document.createElement('div');
+        tag.className = 'file-cancelled-tag';
+        tag.textContent = '发送失败';
+        body.appendChild(tag);
+        setStatus('文件发送失败，连接可能已断开');
+        toast('文件未能发送到任何设备');
+        return;
+      }
+
       bar.value = bar.max; // ensure it lands at 100%
       bar.remove();
       sendCancelBtn.remove();
@@ -1220,6 +1310,10 @@
         mine: true,
         blob: file, // the sender keeps the original File reference
       });
+
+      if (result.failedPeerIds.length) {
+        toast(`已发送至 ${result.deliveredPeerIds.length} 台，${result.failedPeerIds.length} 台失败`);
+      }
 
       // finalize sender-side interactivity using the original File reference
       if (imgEl) {
@@ -1242,10 +1336,17 @@
           card.appendChild(a);
         }
       }
+    } catch (err) {
+      if (bar.isConnected) bar.remove();
+      if (sendCancelBtn.isConnected) sendCancelBtn.remove();
+      const tag = document.createElement('div');
+      tag.className = 'file-cancelled-tag';
+      tag.textContent = '发送失败';
+      body.appendChild(tag);
+      setStatus('文件发送失败');
+      toast('文件发送失败，请重试');
     } finally {
       if (statsTimer) clearInterval(statsTimer);
-      isSending = false;
-      els.fileInput.disabled = false;
     }
   }
 
@@ -1259,6 +1360,8 @@
     if (!t) {
       t = document.createElement('div');
       t.id = 'toast';
+      t.setAttribute('role', 'status');
+      t.setAttribute('aria-live', 'polite');
       document.body.appendChild(t);
     }
     t.textContent = msg;
@@ -1342,7 +1445,8 @@
     els.chatInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') sendChat();
     });
-    els.fileInput.addEventListener('change', onSendFile);
+    els.fileInput.addEventListener('change', onPickSendFiles);
+    els.chatInput.addEventListener('paste', onPasteFiles);
 
     els.imgLightbox.addEventListener('click', closeLightbox);
     document.addEventListener('keydown', (e) => {

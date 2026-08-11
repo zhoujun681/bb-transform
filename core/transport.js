@@ -11,16 +11,51 @@ const Transport = (() => {
   const LAYER_CTRL = 0; // control/mesh signaling (handled in mesh.js via router)
   const LAYER_CHAT = 1;
   const LAYER_FILE = 2; // binary
+  const HEADER_BYTES = 21;
 
-  // Tuning knobs (Feature 2). Defaults are battle-tested; override before this
-  // script loads via window.BT_TUNING = { chunk, highWater, lowWater, window }.
-  // Safe ranges: HIGH_WATER 4–8 MiB (don't exceed ~16 MiB). Default unchanged.
+  // Tuning overrides remain available for diagnostics. Defaults adapt to the
+  // sender: constrained/mobile devices keep small queues, while desktop
+  // Chromium can keep a larger LAN pipe full.
   const T = (typeof window !== 'undefined' && window.BT_TUNING) || {};
-  const CHUNK = T.chunk || 128 * 1024; // 128 KiB — under the ~256 KiB SCTP limit
-  const HIGH_WATER = T.highWater || 4 * 1024 * 1024; // 4 MiB stop-sending gate
-  const LOW_WATER = T.lowWater || 1 * 1024 * 1024; // 1 MiB refill threshold
+  const MiB = 1024 * 1024;
+
+  function detectProfile() {
+    if (typeof navigator === 'undefined') return 'constrained';
+    const memory = Number(navigator.deviceMemory || 0);
+    let mobile = null;
+    if (navigator.userAgentData && typeof navigator.userAgentData.mobile === 'boolean') {
+      mobile = navigator.userAgentData.mobile;
+    } else if (navigator.userAgent) {
+      mobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+    }
+    if (mobile === true || (memory > 0 && memory <= 4) || mobile === null) return 'constrained';
+    return 'desktop';
+  }
+
+  function clampNumber(value, fallback, min, max) {
+    const n = Number(value);
+    return Number.isFinite(n) && n >= min ? Math.min(n, max) : fallback;
+  }
+
+  const PROFILE = detectProfile();
+  const PROFILE_FRAME = PROFILE === 'desktop' ? 256 * 1024 : 128 * 1024;
+  const DEFAULT_HIGH_WATER = PROFILE === 'desktop' ? 12 * MiB : 4 * MiB;
+  const DEFAULT_LOW_WATER = PROFILE === 'desktop' ? 3 * MiB : 1 * MiB;
+  const HIGH_WATER = clampNumber(T.highWater, DEFAULT_HIGH_WATER, 1 * MiB, 16 * MiB);
+  const LOW_WATER = Math.min(
+    clampNumber(T.lowWater, DEFAULT_LOW_WATER, 256 * 1024, 8 * MiB),
+    Math.max(256 * 1024, HIGH_WATER / 2)
+  );
+  // `chunk` remains a payload-byte override for backward compatibility.
+  const LOCAL_MAX_FRAME = clampNumber(
+    T.chunk ? Number(T.chunk) + HEADER_BYTES : PROFILE_FRAME,
+    PROFILE_FRAME,
+    16 * 1024,
+    256 * 1024
+  );
 
   let dcByPeer = new Map(); // peerId -> RTCDataChannel
+  const capsByPeer = new Map(); // peerId -> negotiated/advertised transfer caps
   let onEnvelope = null; // (env, fromPeerId) => void  for JSON messages
   let onFileMeta = null;
   let onFileChunk = null;
@@ -30,17 +65,16 @@ const Transport = (() => {
 
   // incoming file reassembly: fileId -> { meta, chunks:[], received }
   const inbound = new Map();
-  // outbound state: fileId -> { aborted, abortResolve }. aborted: the pump
-  // checks this each iteration and exits without broadcasting 'end'. abortResolve:
-  // if the pump is blocked in drainGate, cancelSend calls it to wake the pump
-  // immediately (instead of waiting for bufferedamountlow).
+  // outbound state: fileId -> { aborted, abortResolvers:Set }. Each receiver has
+  // its own pump and can be waiting on backpressure independently.
   const outbound = new Map();
 
-  function registerChannel(peerId, dc) {
+  function registerChannel(peerId, dc, capabilities) {
     dcByPeer.set(peerId, dc);
+    capsByPeer.set(peerId, { ...(capsByPeer.get(peerId) || {}), ...(capabilities || {}) });
     dc.binaryType = 'arraybuffer';
     // Backpressure: tell the channel to fire 'bufferedamountlow' once the
-    // queued bytes drain below LOW_WATER, so sendWhenDrained can refill the
+    // queued bytes drain below LOW_WATER, so the active pump can refill the
     // pipe BEFORE it runs dry. Without this, the threshold defaults to 0 and
     // the channel idles to empty between bursts — killing throughput.
     if ('bufferedAmountLowThreshold' in dc) {
@@ -56,6 +90,7 @@ const Transport = (() => {
       dc.onmessage = null;
       dcByPeer.delete(peerId);
     }
+    capsByPeer.delete(peerId);
     // clean inbound from that peer (in-flight files from them are lost)
   }
 
@@ -68,6 +103,30 @@ const Transport = (() => {
       dcByPeer.delete(fromId);
       dcByPeer.set(toId, dc);
     }
+    const caps = capsByPeer.get(fromId);
+    if (caps) {
+      capsByPeer.delete(fromId);
+      capsByPeer.set(toId, caps);
+    }
+  }
+
+  function setPeerCapabilities(peerId, capabilities) {
+    if (!peerId || !capabilities) return;
+    const prev = capsByPeer.get(peerId) || {};
+    const next = { ...prev };
+    const maxFrameBytes = Number(capabilities.maxFrameBytes);
+    const maxMessageSize = Number(capabilities.maxMessageSize);
+    if (Number.isFinite(maxFrameBytes) && maxFrameBytes >= 16 * 1024) {
+      next.maxFrameBytes = Math.min(maxFrameBytes, 256 * 1024);
+    }
+    if (Number.isFinite(maxMessageSize) && maxMessageSize > 0) {
+      next.maxMessageSize = maxMessageSize;
+    }
+    capsByPeer.set(peerId, next);
+  }
+
+  function localCapabilities() {
+    return { profile: PROFILE, maxFrameBytes: LOCAL_MAX_FRAME, highWaterBytes: HIGH_WATER };
   }
 
   function hasChannel(peerId) {
@@ -117,8 +176,10 @@ const Transport = (() => {
   function send(peerId, env) {
     const dc = dcByPeer.get(peerId);
     if (dc && dc.readyState === 'open') {
-      dc.send(JSON.stringify(env));
-      return true;
+      try {
+        dc.send(JSON.stringify(env));
+        return true;
+      } catch {}
     }
     return false;
   }
@@ -135,55 +196,25 @@ const Transport = (() => {
     }
   }
 
-  // ---- backpressure-aware binary send ----
-  // Resolves true once the buffer has drained below HIGH_WATER and the send
-  // completed; false if the channel isn't open / send threw. We MUST only
-  // register onbufferedamountlow when we actually pause, and clear it right
-  // after — otherwise concurrent senders (or chat/control messages on the same
-  // channel) would clobber each other's handler and hang.
-  function sendWhenDrained(dc, buf) {
-    return new Promise((resolve) => {
-      const done = (ok) => {
-        resolve(ok);
-      };
-      const trySend = () => {
-        if (dc.readyState !== 'open') return done(false);
-        if (dc.bufferedAmount > HIGH_WATER) {
-          // arm the low-water handler JUST for this drain, then send
-          dc.onbufferedamountlow = () => {
-            dc.onbufferedamountlow = null;
-            trySend();
-          };
-          return;
-        }
-        try {
-          dc.send(buf);
-          done(true);
-        } catch {
-          done(false);
-        }
-      };
-      trySend();
-    });
-  }
-
-  // Wait (once) until a single DataChannel's queue drains below LOW_WATER.
-  // Used by the file-send pump as a single backpressure gate: the pump sends
-  // many chunks WITHOUT awaiting, and only blocks here when bufferedAmount
-  // crosses HIGH_WATER. Because the pump has exactly one in-flight await at a
-  // time, the single-slot onbufferedamountlow can't be clobbered by a second
-  // concurrent waiter (the bug that bit a generic sendWhenDrained in a fan-out).
   function drainGate(dc, ob) {
     return new Promise((resolve) => {
-      if (dc.bufferedAmount <= HIGH_WATER) return resolve();
-      // remember how to wake us; cancelSend calls ob.abortResolve() to break the
-      // wait immediately (don't sit at HIGH_WATER after a cancel).
-      if (ob) ob.abortResolve = resolve;
-      dc.onbufferedamountlow = () => {
-        dc.onbufferedamountlow = null;
-        if (ob) ob.abortResolve = null;
-        resolve();
+      if (dc.readyState !== 'open' || dc.bufferedAmount <= HIGH_WATER) {
+        return resolve(dc.readyState === 'open');
+      }
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (dc.onbufferedamountlow === onLow) dc.onbufferedamountlow = null;
+        if (dc.removeEventListener) dc.removeEventListener('close', onClose);
+        ob.abortResolvers.delete(finish);
+        resolve(!ob.aborted && dc.readyState === 'open');
       };
+      const onLow = () => finish();
+      const onClose = () => finish();
+      ob.abortResolvers.add(finish);
+      dc.onbufferedamountlow = onLow;
+      if (dc.addEventListener) dc.addEventListener('close', onClose, { once: true });
     });
   }
 
@@ -203,106 +234,86 @@ const Transport = (() => {
     broadcast({ ...env, layer: LAYER_CHAT });
   }
 
-  // ---- file send (broadcast to all open peers; progress callback) ----
+  function effectiveChunkSize(peerId) {
+    const caps = capsByPeer.get(peerId) || {};
+    const remoteFrame = Number(caps.maxFrameBytes) > 0 ? Number(caps.maxFrameBytes) : 128 * 1024;
+    const sctpFrame = Number(caps.maxMessageSize) > 0 ? Number(caps.maxMessageSize) : 256 * 1024;
+    const frameSize = Math.max(16 * 1024, Math.min(LOCAL_MAX_FRAME, remoteFrame, sctpFrame, 256 * 1024));
+    return Math.max(1024, frameSize - HEADER_BYTES);
+  }
+
+  function makeFrame(file, fileIdBytes, seq, chunkSize) {
+    const offset = seq * chunkSize;
+    const end = Math.min(offset + chunkSize, file.size);
+    const header = new Uint8Array(HEADER_BYTES);
+    header[0] = LAYER_FILE;
+    header.set(fileIdBytes, 1);
+    header[17] = (seq >>> 24) & 0xff;
+    header[18] = (seq >>> 16) & 0xff;
+    header[19] = (seq >>> 8) & 0xff;
+    header[20] = seq & 0xff;
+    return { frame: new Blob([header, file.slice(offset, end)]), bytes: end - offset };
+  }
+
+  // ---- file send (one independent backpressure pump per open peer) ----
   // fileId is an OPTIONAL caller-supplied id (pre-generate via randomFileId) so
   // the caller can wire a cancel button BEFORE the pump starts. Resolves to
   // { fileId, cancelled } — cancelled is true if cancelSend(id) ran mid-transfer.
   async function sendFile(file, name, progressCb, fileId) {
     const id = fileId || randomFileId();
     const fileIdBytes = fileIdToBytes(id);
-    const total = Math.ceil(file.size / CHUNK);
-    const ob = { aborted: false, abortResolve: null };
+    const ob = { aborted: false, abortResolvers: new Set() };
     outbound.set(id, ob);
     try {
-      const meta = {
-        layer: LAYER_FILE,
-        kind: 'meta',
-        fileId: id,
-        name: name || file.name,
-        size: file.size,
-        type: file.type || 'application/octet-stream',
-        total,
-        ts: Date.now(),
-      };
-      broadcast(meta);
-
       const peers = [...dcByPeer.entries()].filter(([, dc]) => dc.readyState === 'open');
+      const progress = new Map(peers.map(([peerId]) => [peerId, 0]));
+      const emitProgress = (peerId, sentBytes) => {
+        progress.set(peerId, sentBytes);
+        if (!progressCb || ob.aborted) return;
+        const peerProgress = [...progress].map(([id, bytes]) => ({ peerId: id, sentBytes: bytes }));
+        const minSent = peerProgress.length ? Math.min(...peerProgress.map((p) => p.sentBytes)) : 0;
+        progressCb({ fileId: id, sentBytes: minSent, totalBytes: file.size, peers: peerProgress });
+      };
 
-      // Build a ZERO-COPY frame for chunk index seq, returned as a Blob whose
-      // parts are [21-byte header, file slice]. The browser concatenates these in
-      // C++ when dc.send(blob) runs, so the JS main thread never memcpys the
-      // payload (the old ArrayBuffer path copied every 128 KiB chunk — the main
-      // remaining throughput tax on the sender). The wire format is unchanged:
-      // the receiver sees one ArrayBuffer = header ++ payload.
-      //
-      // headerBuf is shared (its first 17 bytes never change); we rewrite the
-      // 4-byte seq per chunk in place. Cheap: 4 byte writes, no allocation.
-      const headerBuf = new ArrayBuffer(21);
-      const headerView = new Uint8Array(headerBuf);
-      headerView[0] = LAYER_FILE;
-      headerView.set(fileIdBytes, 1);
+      const pumpPeer = async (peerId, dc) => {
+        const chunkSize = effectiveChunkSize(peerId);
+        const total = Math.ceil(file.size / chunkSize);
+        const meta = {
+          layer: LAYER_FILE,
+          kind: 'meta',
+          fileId: id,
+          name: name || file.name,
+          size: file.size,
+          type: file.type || 'application/octet-stream',
+          total,
+          ts: Date.now(),
+        };
+        if (!send(peerId, meta)) return { peerId, ok: false };
 
-      async function buildFrame(seq) {
-        const offset = seq * CHUNK;
-        const end = Math.min(offset + CHUNK, file.size);
-        headerView[17] = (seq >>> 24) & 0xff;
-        headerView[18] = (seq >>> 16) & 0xff;
-        headerView[19] = (seq >>> 8) & 0xff;
-        headerView[20] = seq & 0xff;
-        // Blob takes a fresh header part each call (the seq bytes change), but
-        // the file slice is passed through untouched — NO payload copy.
-        const head = new Uint8Array(headerBuf); // view of the current header bytes
-        const blob = new Blob([head, file.slice(offset, end)]);
-        return blob;
-      }
-
-      // PIPELINE PUMP: keep the DataChannel saturated for near-LAN throughput.
-      // WINDOW frames read ahead so blob reads overlap network sends; the send
-      // loop only blocks when bufferedAmount crosses HIGH_WATER (drainGate).
-      const WINDOW = T.window || 3; // frames read ahead (WINDOW*CHUNK bytes max)
-
-      const inflight = [];
-      for (let i = 0; i < WINDOW && i < total; i++) inflight.push(buildFrame(i));
-      let nextSeq = inflight.length;
-
-      let sentCount = 0;
-      let aborted = false;
-      for (let seq = 0; seq < total; seq++) {
-        if (ob.aborted) { aborted = true; break; } // cancelSend fired
-        const frame = await inflight.shift(); // Blob (zero-copy)
-        if (nextSeq < total) inflight.push(buildFrame(nextSeq++));
-
-        const livePeers = peers.filter(([, dc]) => dc.readyState === 'open');
-        if (livePeers.length === 0) {
-          aborted = true;
-          break;
-        }
-        let anyOk = false;
-        for (const [, dc] of livePeers) {
-          // gate: block ONLY when this channel's queue is full, then send.
-          if (dc.bufferedAmount > HIGH_WATER) {
-            try { await drainGate(dc, ob); } catch {}
-            if (ob.aborted) break; // cancel during drain -> stop this frame
-            if (dc.readyState !== 'open') continue; // dropped while draining
+        let sentBytes = 0;
+        for (let seq = 0; seq < total; seq++) {
+          if (ob.aborted || dc.readyState !== 'open') return { peerId, ok: false };
+          if (dc.bufferedAmount > HIGH_WATER && !(await drainGate(dc, ob))) {
+            return { peerId, ok: false };
           }
-          if (sendFrame(dc, frame)) {
-            anyOk = true;
-          }
+          const built = makeFrame(file, fileIdBytes, seq, chunkSize);
+          if (!(await sendFrame(dc, built.frame))) return { peerId, ok: false };
+          sentBytes += built.bytes;
+          emitProgress(peerId, sentBytes);
         }
-        if (ob.aborted) { aborted = true; break; }
-        if (!anyOk) {
-          aborted = true;
-          break;
+        if (ob.aborted || !send(peerId, { layer: LAYER_FILE, kind: 'end', fileId: id, total })) {
+          return { peerId, ok: false };
         }
-        sentCount++;
-        if (!ob.aborted && progressCb) progressCb({ fileId: id, sent: sentCount, total });
-      }
+        return { peerId, ok: true };
+      };
 
-      // only signal completion if we actually sent everything to an open channel
-      if (!aborted && sentCount >= total) {
-        broadcast({ layer: LAYER_FILE, kind: 'end', fileId: id, total });
-      }
-      return { fileId: id, cancelled: ob.aborted };
+      const results = await Promise.all(peers.map(([peerId, dc]) => pumpPeer(peerId, dc)));
+      return {
+        fileId: id,
+        cancelled: ob.aborted,
+        deliveredPeerIds: results.filter((r) => r.ok).map((r) => r.peerId),
+        failedPeerIds: results.filter((r) => !r.ok).map((r) => r.peerId),
+      };
     } finally {
       outbound.delete(id);
     }
@@ -314,7 +325,7 @@ const Transport = (() => {
     const ob = outbound.get(fileId);
     if (ob) {
       ob.aborted = true;
-      if (ob.abortResolve) { const r = ob.abortResolve; ob.abortResolve = null; r(); }
+      for (const resolve of [...ob.abortResolvers]) resolve();
     }
     broadcast({ layer: LAYER_FILE, kind: 'cancel', fileId });
   }
@@ -327,7 +338,7 @@ const Transport = (() => {
   // Some channels/middleboxes reject Blob sends — on the first throw we mark the
   // channel and fall back to converting the Blob to an ArrayBuffer (a copy, but
   // only on the rare channel that can't do Blob). Returns true on success.
-  function sendFrame(dc, frame) {
+  async function sendFrame(dc, frame) {
     if (!dc._bt_noBlob) {
       try {
         dc.send(frame); // Blob path — no payload copy on the main thread
@@ -338,19 +349,14 @@ const Transport = (() => {
       }
     }
     // fallback: Blob -> ArrayBuffer (async), then send
-    frame
-      .arrayBuffer()
-      .then((ab) => {
-        if (dc.readyState === 'open') {
-          try {
-            dc.send(ab);
-          } catch {}
-        }
-      })
-      .catch(() => {});
-    // we couldn't send synchronously; assume it'll likely succeed async for
-    // accounting purposes (the gate + end-signal still protect integrity)
-    return true;
+    try {
+      const ab = await frame.arrayBuffer();
+      if (dc.readyState !== 'open') return false;
+      dc.send(ab);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   // ---- inbound assembly ----
@@ -418,6 +424,8 @@ const Transport = (() => {
     registerChannel,
     closeChannel,
     remapPeer,
+    setPeerCapabilities,
+    localCapabilities,
     hasChannel,
     send,
     broadcast,

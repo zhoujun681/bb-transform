@@ -26,6 +26,11 @@ const Mesh = (() => {
   const selfId = Identity.id();
   const peers = new Map(); // peerId -> { pc, dc, name, status }
   const knownPeers = new Map(); // peerId -> name (roster, includes not-yet-direct)
+  // A recently departed peer can still appear inside another device's stale
+  // roster. Ignore those indirect sightings briefly; a server roster or that
+  // peer's own hello clears the tombstone immediately on a real reconnect.
+  const departedPeers = new Map(); // peerId -> expiry timestamp
+  const DEPARTED_TTL = 30 * 1000;
 
   let handlers = {
     onPeerJoin: () => {},
@@ -146,6 +151,7 @@ const Mesh = (() => {
   // (perfect-negotiation rollback handles any glare). Rate-limited per peer.
   const MAX_RESTARTS = 5;       // give up after this many restart attempts
   const FAIL_RESTART_DELAY = 1500; // debounce before issuing a restart offer
+  const PASSIVE_RETRY_DELAY = 4000; // answerers retry their watchdog while waiting
   const STUCK_WATCHDOG = 25000;     // if ICE isn't connected by now, force restart
                                   // generous: TURN candidate gathering over a slow
                                   // / unreliable path can take 10-20s before ICE
@@ -172,7 +178,10 @@ const Mesh = (() => {
       const cur = peers.get(peerId);
       if (!cur || !cur.pc) return;
       const ice = cur.pc.iceConnectionState;
-      if (ice === 'connected' || ice === 'completed' || ice === 'closed') return;
+      // ICE can report connected before the negotiated DataChannel opens. In
+      // that case the old watchdog must continue; otherwise a later ICE
+      // disconnected state can remain visible forever without another retry.
+      if ((cur.dc && cur.dc.readyState === 'open') || ice === 'closed') return;
       // still stuck after negotiation — escalate to a restart
       cur.status = 'failed';
       handlers.onPeerList && handlers.onPeerList();
@@ -192,6 +201,14 @@ const Mesh = (() => {
       p.status = 'failed';
       handlers.onPeerList && handlers.onPeerList();
       handlers.onLog && handlers.onLog('直连多次失败，可能网络受限（跨网络传输请在页面配置 TURN 服务器）');
+      // Do not leave a dead roster entry forever. A still-live peer can be
+      // rediscovered by its next server hello; a closed page stays removed.
+      setTimeout(() => {
+        const cur = peers.get(peerId);
+        if (cur === p && (!cur.dc || cur.dc.readyState !== 'open') && cur.status === 'failed') {
+          removePeer(peerId);
+        }
+      }, PASSIVE_RETRY_DELAY);
       return;
     }
     p.status = 'restarting';
@@ -201,6 +218,14 @@ const Mesh = (() => {
     if (isOfferer(peerId)) {
       p._restartInFlight = true;
       setTimeout(() => doRestart(peerId), FAIL_RESTART_DELAY);
+    } else {
+      // The answerer must not create an offer, but it still needs a bounded
+      // retry path if the offerer has already gone away.
+      setTimeout(() => {
+        const cur = peers.get(peerId);
+        if (cur !== p || (cur.dc && cur.dc.readyState === 'open')) return;
+        scheduleRestart(peerId);
+      }, PASSIVE_RETRY_DELAY);
     }
   }
 
@@ -269,7 +294,13 @@ const Mesh = (() => {
       const st = pc.iceConnectionState;
       if (st === 'connected' || st === 'completed') {
         markDiag(peerId, 'iceConnected');
-        clearWatchdog(peerId);
+        if (p.dc && p.dc.readyState === 'open') {
+          clearWatchdog(peerId);
+        } else {
+          // ICE has a candidate pair, but the application channel is not open
+          // yet. Keep a bounded watchdog so this cannot become a silent stall.
+          startWatchdog(peerId);
+        }
         if (p.status !== 'connected') {
           p.status = p.dc && p.dc.readyState === 'open' ? 'connected' : 'connecting';
           handlers.onPeerList && handlers.onPeerList();
@@ -283,10 +314,12 @@ const Mesh = (() => {
       } else if (st === 'checking') {
         markDiag(peerId, 'iceChecking');
       } else if (st === 'disconnected') {
-        // transient — the browser usually recovers; watchdog escalates if not
-        if (p.status !== 'failed' && p.status !== 'restarting' && p.status !== 'connected') {
+        // transient in browsers, but only while a live DataChannel exists. If
+        // the channel never opened, keep the retry watchdog armed.
+        if (!p.dc || p.dc.readyState !== 'open') {
           p.status = 'disconnected';
           handlers.onPeerList && handlers.onPeerList();
+          startWatchdog(peerId);
         }
       }
     });
@@ -301,11 +334,11 @@ const Mesh = (() => {
   // ---------- negotiated control channel ----------
   function setupChannel(peerId, pc) {
     const dc = pc.createDataChannel('c', { negotiated: true, id: DC_ID });
-    wireChannel(peerId, dc);
+    wireChannel(peerId, dc, pc);
     return dc;
   }
 
-  function wireChannel(peerId, dc) {
+  function wireChannel(peerId, dc, pc) {
     dc.binaryType = 'arraybuffer';
     dc.onopen = () => {
       const p = peers.get(peerId);
@@ -320,18 +353,24 @@ const Mesh = (() => {
           handlers.onLog && handlers.onLog('直连建立耗时: ' + p.connectMs + ' ms');
         }
       }
+      Transport.setPeerCapabilities(peerId, {
+        maxMessageSize: pc && pc.sctp ? pc.sctp.maxMessageSize : 0,
+      });
       // exchange hello + roster immediately on every open channel
       sendCtrl(peerId, {
         type: 'hello',
         name: Identity.displayName(),
         roster: rosterArray(),
+        transferCaps: Transport.localCapabilities(),
         firstHello: true,
       });
       handlers.onPeerList && handlers.onPeerList();
     };
     dc.onclose = () => handleDisconnect(peerId);
     dc.onerror = () => handleDisconnect(peerId);
-    Transport.registerChannel(peerId, dc);
+    Transport.registerChannel(peerId, dc, {
+      maxMessageSize: pc && pc.sctp ? pc.sctp.maxMessageSize : 0,
+    });
     const p = peers.get(peerId);
     if (p) p.dc = dc;
   }
@@ -417,7 +456,8 @@ const Mesh = (() => {
     let rosterChanged = false;
     switch (d.type) {
       case 'hello':
-        rosterChanged |= mergeName(env.from, d.name || '未知');
+        rosterChanged |= mergeName(env.from, d.name || '未知', true);
+        Transport.setPeerCapabilities(env.from, d.transferCaps);
         if (Array.isArray(d.roster)) {
           for (const e of d.roster) if (e.id !== selfId) rosterChanged |= mergeName(e.id, e.name);
         }
@@ -429,7 +469,10 @@ const Mesh = (() => {
         break;
       case 'peers':
         if (Array.isArray(d.roster)) {
-          for (const e of d.roster) if (e.id !== selfId) rosterChanged |= mergeName(e.id, e.name);
+          const authoritative = env.from === ServerSignaling.SERVER_SOURCE;
+          for (const e of d.roster) {
+            if (e.id !== selfId) rosterChanged |= mergeName(e.id, e.name, authoritative);
+          }
           if (rosterChanged) {
             handlers.onPeerList && handlers.onPeerList();
             broadcastPeers(); // propagate newly learned members
@@ -455,7 +498,10 @@ const Mesh = (() => {
     }
   }
 
-  function mergeName(id, name) {
+  function mergeName(id, name, authoritative = false) {
+    const departedUntil = departedPeers.get(id) || 0;
+    if (departedUntil > Date.now() && !authoritative) return false;
+    if (authoritative || departedUntil <= Date.now()) departedPeers.delete(id);
     const prev = knownPeers.get(id);
     const clean = name || '未知';
     if (!prev) {
@@ -528,7 +574,12 @@ const Mesh = (() => {
   function broadcastHello() {
     for (const pid of peers.keys()) {
       if (pid.startsWith('__pending__')) continue;
-      sendCtrl(pid, { type: 'hello', name: Identity.displayName(), roster: rosterArray() });
+      sendCtrl(pid, {
+        type: 'hello',
+        name: Identity.displayName(),
+        roster: rosterArray(),
+        transferCaps: Transport.localCapabilities(),
+      });
     }
     // also push a fresh hello through the server so newcomers learn us
     if (ServerSignaling.isServerMode()) {
@@ -538,7 +589,13 @@ const Mesh = (() => {
         to: '*',
         ttl: RELAY_TTL,
         id: randomId(),
-        data: { type: 'hello', name: Identity.displayName(), roster: rosterArray(), firstHello: true },
+        data: {
+          type: 'hello',
+          name: Identity.displayName(),
+          roster: rosterArray(),
+          transferCaps: Transport.localCapabilities(),
+          firstHello: true,
+        },
       });
     }
   }
@@ -660,24 +717,24 @@ const Mesh = (() => {
 
   // ---------- disconnect handling ----------
   function handleDisconnect(peerId) {
-    if (!peers.has(peerId)) return;
-    clearWatchdog(peerId);
-    Transport.closeChannel(peerId);
-    const p = peers.get(peerId);
-    if (p && p.pc) {
-      try {
-        p.pc.close();
-      } catch {}
-    }
     removePeer(peerId);
   }
 
   function removePeer(peerId) {
     if (!peers.has(peerId) && !knownPeers.has(peerId)) return;
-    clearWatchdog(peerId);
-    pendingCandidates.delete(peerId); // drop buffered candidates for the old pc
+    const p = peers.get(peerId);
+    // Delete first so closing the pc/data channel cannot re-enter cleanup.
     peers.delete(peerId);
     knownPeers.delete(peerId);
+    pending.delete(peerId);
+    discAt.delete(peerId);
+    departedPeers.set(peerId, Date.now() + DEPARTED_TTL);
+    clearWatchdog(peerId);
+    pendingCandidates.delete(peerId); // drop buffered candidates for the old pc
+    Transport.closeChannel(peerId);
+    if (p && p.pc) {
+      try { p.pc.close(); } catch {}
+    }
     Transport.dropInboundFrom(peerId);
     handlers.onPeerLeave && handlers.onPeerLeave(peerId);
     handlers.onPeerList && handlers.onPeerList();
@@ -768,7 +825,9 @@ const Mesh = (() => {
   }
 
   function connectedPeers() {
-    return [...peers.keys()].filter((id) => !id.startsWith('__pending__'));
+    return [...peers.entries()]
+      .filter(([id, p]) => !id.startsWith('__pending__') && p.dc && p.dc.readyState === 'open')
+      .map(([id]) => id);
   }
 
   // Report the ACTUAL transport in use for a peer's selected ICE candidate pair

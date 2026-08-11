@@ -1,8 +1,10 @@
 FROM node:22-alpine
 
-# coturn = TURN relay (for peers behind mDNS/AP-isolation on phones);
-# supervisor = run coturn + node together in one container.
-RUN apk add --no-cache coturn supervisor
+# The image contains both the signaling server and coturn. Override
+# ALPINE_MIRROR at build time if the default regional mirror is unavailable.
+ARG ALPINE_MIRROR=mirrors.aliyun.com
+RUN sed -i "s|dl-cdn.alpinelinux.org|${ALPINE_MIRROR}|g" /etc/apk/repositories \
+  && apk add --no-cache coturn supervisor
 
 WORKDIR /app
 
@@ -10,17 +12,14 @@ WORKDIR /app
 COPY server/package.json server/package-lock.json* ./server/
 RUN cd server && npm install --omit=dev
 
-# Copy the server, the static app, and the coturn + supervisor configs.
+# Copy the server and static app.
 COPY server ./server
 COPY index.html styles.css app.js ./
 COPY core ./core
 COPY vendor ./vendor
 
-ENV PORT=8080
-# TURN signaling port (TCP+UDP) and the relay UDP range MUST match what's
-# published in docker-compose.yml and server/turnserver.conf.
-ENV TURN_PORT=3478
-EXPOSE 8080 3478
+ENV PORT=8081
+EXPOSE 8081 3478
 
-# Supervisord runs coturn + the node server, restarts either on crash.
+# Supervisord keeps coturn and the Node signaling server in the same image.
 CMD ["supervisord", "-c", "/app/server/supervisord.conf"]

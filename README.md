@@ -61,11 +61,11 @@ node desktop/build.js       # 产物在 desktop/dist/
 ## 功能
 
 - **消息**：输入回车发送，全局共享，自动去重。
-- **文件**：选择文件发送，所有在线设备收到后可下载。大文件流式分块 + 背压 + 零拷贝发送。
+- **文件**：选择文件发送，或在聊天输入框中直接粘贴复制的文件/截图；多个粘贴文件自动排队。所有在线设备收到后可下载。
 - **传输取消**：发送方/接收方都能中途点「取消」，双方立即停止并清理，互相通知。
 - **实时速度**：传输时状态栏显示瞬时速度（MB/s）+ 连接类型（直连/TURN 中转）+ 背压状态。
 - **会话历史**：可保存当前会话（含/不含文件）到 IndexedDB，随时回看。
-- **诊断**：成员列表显示每台设备的直连状态（已直连/直连中/重试中/失败）+ ICE 候选统计。
+- **诊断**：成员列表显示每台设备的直连状态（已直连/直连中/重试中/失败）+ ICE 候选统计；设备退出网页后由信令服务立即通知其他成员移除。
 
 ---
 
@@ -81,6 +81,7 @@ node desktop/build.js       # 产物在 desktop/dist/
 |---|---|---|
 | `host=0 srflx=0 relay=0` 且一直连不上 | **用了自带/国产浏览器**（小米/华为/UC 等基于 WebView，WebRTC 支持差） | **装 Chrome 或 Edge** |
 | 候选正常但 ICE 卡在 `checking`/`failed` | 路由器 AP 隔离 / mDNS 受限，纯 P2P 打不通 | 用 **Docker 方式**（自带 TURN 兜底），或配置 TURN |
+| Linux 端显示 `host=1 srflx=1 relay=0 · ICE: disconnected` | 只收集到了直连/STUN 候选；Linux 防火墙、网络隔离或 standalone 部署未运行 coturn | 放行 UDP、关闭 AP 隔离，或配置可用 TURN；Docker 部署需确认 `3478` 和 `49152–49171/UDP` 已发布 |
 | 同 WiFi 两台设备互不可达 | AP 隔离 / 访客网络 | TURN 中转，或关闭路由器 AP 隔离 |
 | 跨网络（一台 WiFi 一台流量） | 必须有 TURN | 配置 TURN |
 
@@ -97,17 +98,16 @@ Docker 方式已内置 coturn，默认账号 `bbuser:bbpass123`，页面「TURN 
 传输参数可通过浏览器控制台 `window.BT_TUNING` 覆盖（**刷新页面或传输前设置**）：
 
 ```js
-window.BT_TUNING = { highWater: 8*1024*1024, window: 4 };  // 高 RTT 链路可调大窗口提速
+window.BT_TUNING = { highWater: 8*1024*1024, lowWater: 2*1024*1024 };
 ```
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `chunk` | 128 KiB | 分块大小（别超 SCTP ~256KiB 上限） |
-| `highWater` | 4 MiB | 发送背压高水位（安全范围 4–8 MiB，别超 16 MiB） |
-| `lowWater` | 1 MiB | 背压低水位（续发阈值） |
-| `window` | 3 | 预取流水线深度 |
+| `chunk` | 手机约 128 KiB；电脑最高约 256 KiB | 负载大小；还会自动受对端声明和 SCTP 协商上限约束 |
+| `highWater` | 手机 4 MiB；电脑 12 MiB | 发送背压高水位，可覆盖范围 1–16 MiB |
+| `lowWater` | 手机 1 MiB；电脑 3 MiB | 背压续发阈值，始终限制在高水位的一半以内 |
 
-> **为什么没有多线程/多连接提速？** WebRTC 单条 RTCPeerConnection = 单个 SCTP 关联 = 单条网络路径，多 DataChannel / 多连接的带宽**不叠加**，Web Worker 也只解决「不卡 UI」不解决「传得快」。瓶颈在 SCTP 网络出栈，不在 JS 线程。所以优化方向是单连接内的窗口/背压调优，而非多线程。
+> **为什么没有多连接提速？** 每对设备仍使用一条 RTCPeerConnection/SCTP 路径，通过设备能力协商、较大的桌面端发送队列和 DataChannel 背压保持链路饱和。向多台设备广播时每台设备有独立发送泵，慢设备不会让快设备停发。
 
 传输时状态栏若显示「· 排空队列」，说明瓶颈在背压（`bufferedAmount` 顶到高水位），可尝试调大 `highWater`。
 
