@@ -38,8 +38,23 @@ body {
   z-index: 10;
 }
 .brand {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
   font-weight: 700;
   font-size: 18px;
+  white-space: nowrap;
+}
+.app-version {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+.app-version::before {
+  content: attr(data-version);
 }
 .name-row {
   display: flex;
@@ -186,6 +201,17 @@ button.primary:hover {
   gap: 16px;
 }
 @media (max-width: 760px) {
+  .topbar {
+    flex-wrap: wrap;
+  }
+  .name-row {
+    flex: 1 1 100%;
+  }
+  .name-row input {
+    flex: 1;
+    min-width: 0;
+    width: auto;
+  }
   .room-grid {
     grid-template-columns: 1fr;
   }
